@@ -164,27 +164,25 @@ class UNet(nn.Module):
         super(UNet, self).__init__()
 
         # Encoder
-        self.inc = DoubleConv(n_channels, 64)
+        self.inc = DoubleConv(n_channels, 32)
 
-        self.down1 = Down(64, 128)
+        self.down1 = Down(32,64)
 
-        self.down2 = Down(128, 256)
+        self.down2 = Down(64,128)
 
-        self.down3 = Down(256, 512)
+        self.down3 = Down(128,256)
 
-        self.down4 = Down(512, 1024)
+        self.down4 = Down(256,512)
 
-        # Decoder
-        self.up1 = Up(1024, 512)
+        self.up1 = Up(512,256)
 
-        self.up2 = Up(512, 256)
+        self.up2 = Up(256,128)
 
-        self.up3 = Up(256, 128)
+        self.up3 = Up(128,64)
 
-        self.up4 = Up(128, 64)
+        self.up4 = Up(64,32)
 
-        # Output
-        self.outc = OutConv(64, n_classes)
+        self.outc = OutConv(32,n_classes)
 
     def forward(self, x):
 
