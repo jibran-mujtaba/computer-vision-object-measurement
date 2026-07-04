@@ -1,4 +1,5 @@
 import os
+import csv
 import cv2
 import numpy as np
 
@@ -15,8 +16,7 @@ PROJECT_ROOT = os.path.dirname(
 # NOTE: calibrate.py saves to <script_dir>/calibration_data.npz, and
 # calibrate.py itself lives in calibration/images/. This path MUST
 # point at the exact same file calibrate.py wrote, or you'll silently
-# load a stale/unrelated calibration (this was the root cause of the
-# "undistortion breaks detection" bug).
+# load a stale/unrelated calibration.
 CALIBRATION_FILE = os.path.join(
     PROJECT_ROOT,
     "calibration",
@@ -35,6 +35,8 @@ DEBUG_FOLDER = os.path.join(
     "debug"
 )
 
+TRIALS_CSV_PATH = os.path.join(OUTPUT_FOLDER, "trials.csv")
+
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 os.makedirs(DEBUG_FOLDER, exist_ok=True)
 
@@ -49,6 +51,8 @@ MIN_ROI_AREA = 4000
 # the actual cause of "detection fails in pipeline but works
 # on raw image" symptoms.
 MAX_DETECT_SIZE = 2600
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
 
 
 def _debug_save(name, image):
@@ -83,8 +87,6 @@ def load_calibration():
     if "calibrationImageSize" in data:
         calib_w, calib_h = data["calibrationImageSize"]
     else:
-        # Older calibration files may not have stored this — without
-        # it we cannot safely rescale, so refuse to guess.
         raise RuntimeError(
             "\nThis calibration file has no 'calibrationImageSize' entry, "
             "so the camera matrix cannot be safely rescaled to match the "
@@ -101,16 +103,9 @@ def load_calibration():
 
 def scale_camera_matrix(camera_matrix, calib_size, actual_size):
     """
-    A camera matrix's fx, fy, cx, cy are expressed in pixels at the
-    specific resolution the calibration images were captured/resized to.
-    Applying it directly to an image of a *different* resolution
-    (e.g. calibrated at 4624x3468 but measuring a 9248x6936 photo)
-    silently produces a wrong distortion model and warps the image
-    incorrectly rather than correcting it.
-
-    This rescales fx, fy, cx, cy proportionally to the actual image size.
-    Distortion coefficients (k1, k2, p1, p2, k3) are dimensionless ratios
-    and do NOT need rescaling.
+    Rescales fx, fy, cx, cy proportionally to the actual image size, since
+    a camera matrix calibrated at one resolution is not directly valid at
+    another. Distortion coefficients are dimensionless and untouched.
     """
     calib_w, calib_h = calib_size
     actual_w, actual_h = actual_size
@@ -137,14 +132,6 @@ def scale_camera_matrix(camera_matrix, calib_size, actual_size):
 # UNDISTORT IMAGE
 # ==========================================================
 def _sanity_check_calibration(camera_matrix, image_shape):
-    """
-    Warn loudly if the calibration's principal point looks
-    inconsistent with the image it's about to be applied to.
-    A mismatch here means the calibration was likely computed
-    at a different resolution/aspect ratio, or converged poorly,
-    and undistort() will warp the image incorrectly rather than
-    fixing it.
-    """
     h, w = image_shape[:2]
     cx, cy = camera_matrix[0, 2], camera_matrix[1, 2]
 
@@ -171,9 +158,6 @@ def undistort_image(image, camera_matrix, distortion):
 
     h, w = image.shape[:2]
 
-    # Actually invoke the sanity check now — previously this function
-    # existed but was never called, so a mismatched calibration would
-    # silently corrupt every undistorted image with no warning at all.
     _sanity_check_calibration(camera_matrix, image.shape)
 
     new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
@@ -217,16 +201,9 @@ def _resize_for_detection(image):
 
 
 def _make_gray_variants(image, tag=""):
-    """
-    Produce several candidate grayscale preprocessings.
-    Returns a list of (label, gray_image) tuples, tried in order.
-    Saves each to disk for visual inspection.
-    """
-
     resized, scale = _resize_for_detection(image)
 
     gray_raw = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-
     gray_eq = cv2.equalizeHist(gray_raw)
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -289,10 +266,6 @@ def _try_patterns(gray, label=""):
 
 
 def _try_all_variants(image, tag):
-    """
-    Try every preprocessing variant against both pattern orientations.
-    Returns found, corners, pattern, scale, variant_label
-    """
     variants, scale = _make_gray_variants(image, tag)
 
     for label, gray in variants:
@@ -391,7 +364,6 @@ def detect_checkerboard(image, image_tag="undistorted"):
 
     _debug_save(f"{image_tag}_input.jpg", image)
 
-    # ---- Attempt 1: full image, all preprocessing variants ----
     print(f"\n[Step 1] Full-image detection ({image_tag})...")
     found, corners, pattern, scale, variant = _try_all_variants(image, f"{image_tag}_full")
 
@@ -400,7 +372,6 @@ def detect_checkerboard(image, image_tag="undistorted"):
     if found:
         print(f"  -> SUCCESS on full image using '{variant}' preprocessing, pattern {pattern}")
 
-    # ---- Attempt 2: ROI-isolated, all preprocessing variants ----
     if not found:
         print(f"\n[Step 2] Full-image detection failed. Trying ROI isolation ({image_tag})...")
         roi, (offset_x, offset_y) = locate_checkerboard_region(image)
@@ -413,7 +384,6 @@ def detect_checkerboard(image, image_tag="undistorted"):
         print(f"\n  [RESULT] Checkerboard NOT found in {image_tag} image, any variant, any pattern.")
         return False, None, None, None
 
-    # ---- Refine corners on the SAME gray image that succeeded ----
     if offset_x == 0 and offset_y == 0:
         variants, _ = _make_gray_variants(image, f"{image_tag}_refine_full")
     else:
@@ -427,9 +397,6 @@ def detect_checkerboard(image, image_tag="undistorted"):
         (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     )
 
-    # Corners were found on a RESIZED gray image (see _resize_for_detection).
-    # Scale back up to the coordinate space of `image` (or the ROI crop)
-    # before adding the ROI offset.
     inv_scale = 1.0 / scale if scale != 1 else 1.0
     corners = corners * inv_scale
 
@@ -486,7 +453,7 @@ def calculate_pixels_per_mm(corners, detected_pattern):
 # SEGMENT OBJECT
 # ==========================================================
 
-def get_segmentation(image):
+def get_segmentation(image, tag="segmentation"):
 
     print("\nRunning segmentation...")
 
@@ -499,7 +466,7 @@ def get_segmentation(image):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    _debug_save("segmentation_mask.jpg", mask)
+    _debug_save(f"{tag}_mask.jpg", mask)
 
     print(f"Segmentation confidence: {confidence:.3f}")
 
@@ -562,10 +529,18 @@ def draw_measurement(image, result, confidence):
 
 
 # ==========================================================
-# MAIN PIPELINE
+# SINGLE-IMAGE PIPELINE
 # ==========================================================
 
-def run_measurement(image_path):
+def run_measurement(image_path, camera_matrix=None, distortion=None, calib_size=None,
+                     quiet_diagnostics=False):
+    """
+    Runs the full pipeline on one image.
+
+    camera_matrix / distortion / calib_size can be passed in (pre-loaded)
+    when processing a batch, so calibration is loaded from disk only once
+    instead of once per image.
+    """
 
     print("=" * 60)
     print("Object Measurement Pipeline")
@@ -582,12 +557,9 @@ def run_measurement(image_path):
             f"Could not read image (corrupt or unsupported): {image_path}"
         )
 
-    camera_matrix, distortion, calib_size = load_calibration()
+    if camera_matrix is None or distortion is None or calib_size is None:
+        camera_matrix, distortion, calib_size = load_calibration()
 
-    # Rescale the camera matrix to match THIS image's actual resolution.
-    # Without this, a matrix calibrated on (e.g.) 4624x3468 images gets
-    # applied as-is to a 9248x6936 photo, which warps it incorrectly and
-    # is exactly what caused checkerboard detection to fail post-undistort.
     actual_size = (image.shape[1], image.shape[0])  # (w, h)
     if actual_size != calib_size:
         camera_matrix = scale_camera_matrix(camera_matrix, calib_size, actual_size)
@@ -596,68 +568,43 @@ def run_measurement(image_path):
 
     undistorted = undistort_image(image, camera_matrix, distortion)
 
-    # --------------------------------------------------
-    # DIAGNOSTIC: try detection on RAW image first, to
-    # isolate whether undistortion is what's breaking it.
-    # --------------------------------------------------
-    print("\n" + "#" * 60)
-    print("# DIAGNOSTIC PASS: detection on RAW (pre-undistortion) image")
-    print("#" * 60)
+    stem = os.path.splitext(os.path.basename(image_path))[0]
 
-    raw_found, raw_corners, raw_pattern, raw_variant = detect_checkerboard(
-        image, image_tag="raw"
-    )
+    if not quiet_diagnostics:
+        print("\n" + "#" * 60)
+        print("# DIAGNOSTIC PASS: detection on RAW (pre-undistortion) image")
+        print("#" * 60)
+        raw_found, _, _, _ = detect_checkerboard(image, image_tag=f"{stem}_raw")
+    else:
+        raw_found = None
 
     print("\n" + "#" * 60)
     print("# MAIN PASS: detection on UNDISTORTED image")
     print("#" * 60)
 
     und_found, und_corners, und_pattern, und_variant = detect_checkerboard(
-        undistorted, image_tag="undistorted"
+        undistorted, image_tag=f"{stem}_undistorted"
     )
 
-    print("\n" + "=" * 60)
-    print("DIAGNOSTIC SUMMARY")
-    print("=" * 60)
-    print(f"  Raw image detection:         {'SUCCESS' if raw_found else 'FAILED'}")
-    print(f"  Undistorted image detection: {'SUCCESS' if und_found else 'FAILED'}")
-
-    if raw_found and not und_found:
-        print(
-            "\n  >>> Detection works on the RAW image but fails after "
-            "undistortion.\n"
-            "  >>> Check: (1) is CALIBRATION_FILE actually pointing at the "
-            "calibration_data.npz you most recently generated? (2) did the "
-            "sanity-check ratios above look reasonable (~0.4-0.6)? "
-            "If both check out and this still fails, the calibration itself "
-            "may have converged poorly (high RMS error) and should be redone "
-            "with better/more calibration images.\n"
-            "  >>> Check debug images: undistorted_input.jpg vs raw_input.jpg\n"
-            "  >>> in outputs/measurement_results/debug/ to compare visually.\n"
-        )
-    elif not raw_found and not und_found:
-        print(
-            "\n  >>> Detection fails on BOTH raw and undistorted images.\n"
-            "  >>> This points to something in the shared detection logic "
-            "itself (pattern size, image quality, board visibility) rather "
-            "than the undistortion step. Inspect the saved debug grayscale "
-            "variants in outputs/measurement_results/debug/ directly.\n"
-        )
-
-    print("=" * 60)
+    if raw_found is not None:
+        print("\n" + "=" * 60)
+        print("DIAGNOSTIC SUMMARY")
+        print("=" * 60)
+        print(f"  Raw image detection:         {'SUCCESS' if raw_found else 'FAILED'}")
+        print(f"  Undistorted image detection: {'SUCCESS' if und_found else 'FAILED'}")
+        print("=" * 60)
 
     if not und_found:
         raise RuntimeError(
-            "\nCheckerboard could not be detected in the undistorted image.\n"
-            "See DIAGNOSTIC SUMMARY above and inspect debug images in:\n"
-            f"{DEBUG_FOLDER}\n"
+            f"\nCheckerboard could not be detected in the undistorted image "
+            f"for {image_path}.\nSee debug images in:\n{DEBUG_FOLDER}\n"
         )
 
     corners, detected_pattern = und_corners, und_pattern
 
     pixels_per_mm = calculate_pixels_per_mm(corners, detected_pattern)
 
-    mask, confidence = get_segmentation(undistorted)
+    mask, confidence = get_segmentation(undistorted, tag=stem)
 
     result = measure_object(mask, pixels_per_mm)
 
@@ -671,17 +618,117 @@ def run_measurement(image_path):
 
     output_image = draw_measurement(undistorted, result, confidence)
 
-    output_path = os.path.join(OUTPUT_FOLDER, "measurement_result.jpg")
+    output_path = os.path.join(OUTPUT_FOLDER, f"{stem}_measurement_result.jpg")
     cv2.imwrite(output_path, output_image)
 
-    mask_path = os.path.join(OUTPUT_FOLDER, "segmentation_mask.jpg")
+    mask_path = os.path.join(OUTPUT_FOLDER, f"{stem}_segmentation_mask.jpg")
     cv2.imwrite(mask_path, mask)
 
     print(f"\nSaved: {output_path}")
     print(f"Saved: {mask_path}")
-    print(f"All intermediate debug images saved to: {DEBUG_FOLDER}")
 
+    result["confidence"] = confidence
+    result["image_path"] = image_path
     return result
+
+
+# ==========================================================
+# BATCH PIPELINE (folder of images)
+# ==========================================================
+
+def get_image_files(folder_path):
+    files = []
+    for name in sorted(os.listdir(folder_path)):
+        ext = os.path.splitext(name)[1].lower()
+        if ext in IMAGE_EXTENSIONS:
+            files.append(os.path.join(folder_path, name))
+    return files
+
+
+def run_batch(folder_path):
+
+    image_files = get_image_files(folder_path)
+
+    print("=" * 60)
+    print("BATCH MODE")
+    print("=" * 60)
+    print(f"Folder: {folder_path}")
+    print(f"Found {len(image_files)} image(s)")
+    print("=" * 60)
+
+    if not image_files:
+        print("ERROR: No images found in folder.")
+        return
+
+    # Load calibration once for the whole batch instead of once per image.
+    camera_matrix, distortion, calib_size = load_calibration()
+
+    rows = []
+    succeeded = 0
+    failed = 0
+
+    for idx, image_path in enumerate(image_files):
+        print(f"\n\n{'#'*70}")
+        print(f"# [{idx+1}/{len(image_files)}] {os.path.basename(image_path)}")
+        print(f"{'#'*70}")
+
+        try:
+            result = run_measurement(
+                image_path,
+                camera_matrix=camera_matrix,
+                distortion=distortion,
+                calib_size=calib_size,
+                quiet_diagnostics=True,   # skip the raw-image diagnostic pass in batch mode, for speed
+            )
+            rows.append({
+                "trial_id": idx + 1,
+                "image_name": os.path.basename(image_path),
+                "pred_width_mm": round(result["width_mm"], 2),
+                "pred_height_mm": round(result["height_mm"], 2),
+                "confidence": round(result["confidence"], 3),
+                "actual_width_mm": "",   # fill in after measuring the physical object
+                "actual_height_mm": "",  # fill in after measuring the physical object
+                "status": "ok",
+            })
+            succeeded += 1
+
+        except Exception as e:
+            print(f"  ERROR processing {image_path}: {e}")
+            rows.append({
+                "trial_id": idx + 1,
+                "image_name": os.path.basename(image_path),
+                "pred_width_mm": "",
+                "pred_height_mm": "",
+                "confidence": "",
+                "actual_width_mm": "",
+                "actual_height_mm": "",
+                "status": f"FAILED: {e}",
+            })
+            failed += 1
+
+    fieldnames = [
+        "trial_id", "image_name", "pred_width_mm", "pred_height_mm",
+        "confidence", "actual_width_mm", "actual_height_mm", "status",
+    ]
+    with open(TRIALS_CSV_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print("\n\n" + "=" * 60)
+    print("BATCH SUMMARY")
+    print("=" * 60)
+    print(f"Total images:      {len(image_files)}")
+    print(f"Succeeded:         {succeeded}")
+    print(f"Failed:            {failed}")
+    print(f"\nTrials CSV saved to:\n{TRIALS_CSV_PATH}")
+    print(
+        "\nNEXT STEP: open trials.csv and fill in 'actual_width_mm' / "
+        "'actual_height_mm' for each image using a physical ruler/caliper "
+        "measurement of that same object placement, then run validate_accuracy.py "
+        "on this CSV."
+    )
+    print("=" * 60)
 
 
 if __name__ == "__main__":
@@ -689,9 +736,16 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Measure real-world object dimensions from an image."
+        description="Measure real-world object dimensions from an image or a folder of images."
     )
-    parser.add_argument("image_path", type=str, help="Path to the input image.")
+    parser.add_argument(
+        "image_path",
+        type=str,
+        help="Path to a single input image, OR a folder of images to batch-process."
+    )
     args = parser.parse_args()
 
-    run_measurement(args.image_path)
+    if os.path.isdir(args.image_path):
+        run_batch(args.image_path)
+    else:
+        run_measurement(args.image_path)
